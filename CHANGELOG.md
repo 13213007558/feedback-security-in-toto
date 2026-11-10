@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+* Strict parameter substitution mode for `verifylib.substitute_parameters` and
+  `verifylib.in_toto_verify` (`strict=True`). It accepts only simple `{name}`
+  placeholders and escaped braces, rejects attribute access, subscripts,
+  conversion flags, format specs and missing parameters, and inserts values
+  verbatim without recursive re-parsing. The whole layout is validated before
+  any field is changed, so a failure leaves the signed layout unsubstituted.
+  A new `ParameterSubstitutionError` is raised on strict-mode failures. The
+  legacy `str.format` behavior remains the default.
+
 ## v3.1.0
 
 This release includes version bumpbs, as well as upgraded debian support , and

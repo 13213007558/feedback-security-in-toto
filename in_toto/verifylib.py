@@ -29,6 +29,7 @@ import datetime
 import fnmatch
 import logging
 import os
+import re
 
 import iso8601
 import securesystemslib.exceptions
@@ -45,6 +46,7 @@ import in_toto.settings
 from in_toto.exceptions import (
     BadReturnValueError,
     LayoutExpiredError,
+    ParameterSubstitutionError,
     RuleVerificationError,
     SignatureVerificationError,
     ThresholdVerificationError,
@@ -281,80 +283,171 @@ def verify_layout_expiration(layout):
         raise LayoutExpiredError("Layout expired")
 
 
-def substitute_parameters(layout, parameter_dictionary):
+# Matches a simple, strict placeholder such as ``{NAME}``. The name space is
+# intentionally identical to the one enforced by ``_check_parameter_dict`` so
+# that any other content between braces is rejected rather than interpreted.
+_PLACEHOLDER_RE = re.compile(r"^\{([a-zA-Z0-9_-]+)\}$")
+
+
+def _strict_substitute(template, parameter_dictionary):
+    """Substitute simple placeholders in ``template`` in a single pass.
+
+    Only literal text and simple ``{name}`` placeholders are accepted, together
+    with braces escaped as ``{{`` and ``}}``. Attribute access (``{a.b}``),
+    subscripts (``{a[0]}``), conversion flags (``{a!r}``) and format specs
+    (``{a:b}``) are all rejected, as are placeholders for which no parameter is
+    provided. Substituted values are inserted verbatim: they are never scanned
+    again, so a value containing braces or more placeholders cannot introduce
+    additional rule tokens or trigger a second, recursive substitution.
+
+    Raises:
+      ParameterSubstitutionError: if the template uses unsupported syntax or a
+          referenced parameter is missing.
+
+    """
+    result = []
+    index = 0
+    length = len(template)
+
+    while index < length:
+        char = template[index]
+
+        if char not in "{}":
+            result.append(char)
+            index += 1
+            continue
+
+        # Escaped opening or closing brace.
+        if index + 1 < length and template[index + 1] == char:
+            result.append(char)
+            index += 2
+            continue
+
+        if char == "}":
+            raise ParameterSubstitutionError(
+                f"unescaped closing brace in template '{template}'"
+            )
+
+        end = template.find("}", index + 1)
+        if end == -1:
+            raise ParameterSubstitutionError(
+                f"unmatched opening brace in template '{template}'"
+            )
+
+        placeholder = template[index : end + 1]
+        match = _PLACEHOLDER_RE.fullmatch(placeholder)
+        if match is None:
+            raise ParameterSubstitutionError(
+                f"unsupported placeholder syntax '{placeholder}' in template"
+                f" '{template}'; only simple '{{name}}' placeholders"
+                " are allowed"
+            )
+
+        name = match.group(1)
+        if name not in parameter_dictionary:
+            raise ParameterSubstitutionError(
+                f"missing parameter '{name}' for placeholder '{placeholder}'"
+                f" in template '{template}'"
+            )
+
+        # Insert the value verbatim, without re-parsing it for placeholders.
+        result.append(parameter_dictionary[name])
+        index = end + 1
+
+    return "".join(result)
+
+
+def substitute_parameters(layout, parameter_dictionary, *, strict=False):
     """
     <Purpose>
       This function is a transitionary measure for parameter substitution (or
       any other solution defined by the in-toto team). As of now, it acts as
-      a very simple replacement layer for python-like parameters
+      a very simple replacement layer for python-like parameters.
+
+      In legacy mode (``strict=False``, the default) substitution is performed
+      with Python's ``str.format``. In strict mode (``strict=True``) only simple
+      ``{name}`` placeholders and escaped braces (``{{``/``}}``) are accepted,
+      see ``_strict_substitute``. Strict mode rejects attribute access,
+      subscripts, conversion flags, format specifications and missing
+      parameters, and inserts values verbatim so that they cannot be re-parsed
+      into additional rule tokens or command arguments.
+
+      The entire layout is validated before any field is modified. If a single
+      step or inspection cannot be substituted, the passed layout is left
+      untouched.
 
     <Arguments>
       layout:
               The Layout object to process.
 
-        parameter_dictionary:
+      parameter_dictionary:
               A dictionary containing key-value pairs for substitution.
+
+      strict:
+              Optional boolean selecting the strict placeholder syntax
+              described above. Defaults to the legacy ``str.format`` behavior.
 
     <Exceptions>
       securesystemslib.exceptions.FormatError:
         if the parameter dictionary is malformed.
 
       KeyError:
-        if one of the keys in the parameter dictionary are not present for
-        substitution
+        in legacy mode, if a placeholder references a missing parameter.
+
+      ParameterSubstitutionError:
+        in strict mode, if a template uses unsupported placeholder syntax or
+        references a missing parameter.
 
     <Side Effects>
-      The layout object will have any tags replaced with the corresponding
-      values defined in the parameter dictionary.
+      On success the layout object has its placeholders replaced with the
+      corresponding values from the parameter dictionary. On failure the layout
+      is not modified.
     """
     _check_parameter_dict(parameter_dictionary)
 
+    def substitute(value):
+        if strict:
+            return _strict_substitute(value, parameter_dictionary)
+        return value.format(**parameter_dictionary)
+
+    def substitute_rules(rules):
+        return [[substitute(stanza) for stanza in rule] for rule in rules]
+
+    # Build the complete, substituted layout content first. Any exception raised
+    # while doing so happens before we assign anything back, leaving the layout
+    # in its original, unsubstituted state.
+    new_steps = []
     for step in layout.steps:
-        new_material_rules = []
-        for rule in step.expected_materials:
-            new_rule = [
-                stanza.format(**parameter_dictionary) for stanza in rule
-            ]
-            new_material_rules.append(new_rule)
+        new_steps.append(
+            (
+                step,
+                substitute_rules(step.expected_materials),
+                substitute_rules(step.expected_products),
+                [substitute(argv) for argv in step.expected_command],
+            )
+        )
 
-        new_product_rules = []
-        for rule in step.expected_products:
-            new_rule = []
-            for stanza in rule:
-                new_rule.append(stanza.format(**parameter_dictionary))
-            new_product_rules.append(new_rule)
-
-        new_expected_command = [
-            argv.format(**parameter_dictionary)
-            for argv in step.expected_command
-        ]
-
-        step.expected_command = new_expected_command
-        step.expected_materials = new_material_rules
-        step.expected_products = new_product_rules
-
+    new_inspections = []
     for inspection in layout.inspect:
-        new_material_rules = []
-        for rule in inspection.expected_materials:
-            new_rule = []
-            for stanza in rule:
-                new_rule.append(stanza.format(**parameter_dictionary))
-            new_material_rules.append(new_rule)
+        new_inspections.append(
+            (
+                inspection,
+                substitute_rules(inspection.expected_materials),
+                substitute_rules(inspection.expected_products),
+                [substitute(argv) for argv in inspection.run],
+            )
+        )
 
-        new_product_rules = []
-        for rule in inspection.expected_products:
-            new_rule = []
-            for stanza in rule:
-                new_rule.append(stanza.format(**parameter_dictionary))
-            new_product_rules.append(new_rule)
+    # All placeholders resolved successfully, only now commit the changes.
+    for step, materials, products, command in new_steps:
+        step.expected_materials = materials
+        step.expected_products = products
+        step.expected_command = command
 
-        new_run = [
-            argv.format(**parameter_dictionary) for argv in inspection.run
-        ]
-
-        inspection.run = new_run
-        inspection.expected_materials = new_material_rules
-        inspection.expected_products = new_product_rules
+    for inspection, materials, products, run in new_inspections:
+        inspection.expected_materials = materials
+        inspection.expected_products = products
+        inspection.run = run
 
 
 def verify_metadata_signatures(metadata, keys_dict):
@@ -1489,6 +1582,7 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
     step_name="",
     persist_inspection_links=True,
     inspect_timeout=in_toto.settings.LINK_CMD_EXEC_TIMEOUT,
+    strict=False,
 ):
     """Performs complete in-toto supply chain verification for a final product.
 
@@ -1537,6 +1631,14 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
           for artifact rules (steps and inspections), the expected command
           attribute (steps), and the run attribute (inspections) in the layout.
 
+      strict (optional): A boolean selecting strict parameter substitution.
+          When True only simple ``{name}`` placeholders (and escaped braces)
+          are accepted and values are inserted verbatim, see
+          ``substitute_parameters``. Defaults to False for legacy behavior.
+          This flag only affects the layout passed to this verification call;
+          sublayouts are verified in their own recursive calls and never
+          inherit the caller's parameters or this flag.
+
       step_name (optional): A name assigned to the returned link. This is mostly
           useful during recursive sublayout verification.
 
@@ -1549,6 +1651,10 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
 
     Raises:
       securesystemslib.exceptions.FormatError: Passed parameters are malformed.
+
+      ParameterSubstitutionError: Strict parameter substitution is enabled and
+          a layout template uses unsupported placeholder syntax or references a
+          missing parameter.
 
       SignatureVerificationError: No layout verification key is passed, or any of
           the passed keys fails to verify a signature.
@@ -1592,10 +1698,14 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
     LOG.info("Verifying layout expiration...")
     verify_layout_expiration(layout)
 
-    # If there are parameters sent to the translation layer, substitute them
+    # If there are parameters sent to the translation layer, substitute them.
+    # This runs only after the original, signed layout has been authenticated,
+    # so the substituted data is never used as the signed payload itself.
     if substitution_parameters is not None:
         LOG.info("Performing parameter substitution...")
-        substitute_parameters(layout, substitution_parameters)
+        substitute_parameters(
+            layout, substitution_parameters, strict=strict
+        )
 
     LOG.info("Reading link metadata files...")
     steps_metadata = load_links_for_layout(layout, link_dir_path)

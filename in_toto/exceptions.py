@@ -41,3 +41,13 @@ class PrefixError(Error):
 
 class InvalidMetadata(Error):  # noqa: N818
     """Indicates that the metadata is not valid."""
+
+
+class ParameterSubstitutionError(Error):
+    """Indicates that strict parameter substitution could not be performed.
+
+    Raised in strict substitution mode when a template contains syntax that is
+    not a simple ``{name}`` placeholder (or an escaped ``{{`` / ``}}`` brace),
+    references a parameter that is not present in the parameter dictionary, or
+    would otherwise change the structure of a rule or command.
+    """
