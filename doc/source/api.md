@@ -41,3 +41,9 @@ documented [in-toto#663](https://github.com/in-toto/in-toto/issues/663).
 ```{eval-rst}
 .. autofunction:: in_toto.verifylib.in_toto_verify
 ```
+
+## Artifact Rule Explanations
+
+Machine-readable explanations of artifact rule verification, including
+per-rule queue snapshots and MATCH comparison details, are documented in
+{doc}`rule-explanations`.

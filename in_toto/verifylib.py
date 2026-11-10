@@ -39,6 +39,7 @@ from securesystemslib._gpg.exceptions import KeyExpirationError
 import in_toto.formats
 import in_toto.models.layout
 import in_toto.models.link
+import in_toto.rule_explainer
 import in_toto.rulelib
 import in_toto.runlib
 import in_toto.settings
@@ -1011,7 +1012,15 @@ def _get_artifact_rule_traceback():
     return traceback_str
 
 
-def verify_item_rules(source_name, source_type, rules, links):
+def verify_item_rules(
+    source_name,
+    source_type,
+    rules,
+    links,
+    report=None,
+    link_provenance=None,
+    artifact_filter=None,
+):
     """
     <Purpose>
       Apply all passed material or product rules (see source_type) of a given
@@ -1053,6 +1062,25 @@ def verify_item_rules(source_name, source_type, rules, links):
                 ...
               }
 
+      report: (optional)
+              A ``rule_explainer.RuleVerificationReport``. When provided, a
+              machine-readable explanation of the rule execution is appended to
+              the report. On failure the report keeps all rules up to and
+              including the failing rule.
+
+      link_provenance: (optional)
+              Mapping of item name to a ``rule_explainer.PROVENANCE_*`` string,
+              forwarded to the explainer. Links not listed are reported as
+              unverified and never marked trusted. Only callers that have
+              actually verified a link signature should label it
+              ``"signature-verified"``.
+
+      artifact_filter: (optional)
+              Optional iterable of artifact paths. Restricts the detailed
+              per-artifact evidence in ``report`` to the given paths. All rules
+              still run and consume artifacts regardless of the filter; only
+              queue snapshots stay complete.
+
     <Exceptions>
       FormatError
           if source_type is not "materials" or "products", or
@@ -1064,9 +1092,21 @@ def verify_item_rules(source_name, source_type, rules, links):
           if a REQUIRE rule does not find a required artifact.
 
     <Side Effects>
-      Clears and populates the global RULE_TRACE data structure.
+      Clears and populates the global RULE_TRACE data structure. If ``report``
+      is passed, also appends a machine-readable explanation to it.
 
     """
+    if report is not None:
+        explainer = in_toto.rule_explainer.RuleExplainer(
+            links,
+            link_provenance=link_provenance,
+            artifact_filter=artifact_filter,
+        )
+        explainer.explain_item_rules(
+            report, source_name, source_type, rules
+        )
+        return
+
     if source_type not in {"materials", "products"}:
         raise securesystemslib.exceptions.FormatError(
             "Argument 'source_type' of function 'verify_item_rules' has to be "
@@ -1153,7 +1193,13 @@ def verify_item_rules(source_name, source_type, rules, links):
         )
 
 
-def verify_all_item_rules(items, links):
+def verify_all_item_rules(
+    items,
+    links,
+    report=None,
+    link_provenance=None,
+    artifact_filter=None,
+):
     """
     <Purpose>
       Iteratively verifies artifact rules of passed items (Steps or Inspections).
@@ -1170,6 +1216,21 @@ def verify_all_item_rules(items, links):
                 ...
               }
 
+      report: (optional)
+              A ``rule_explainer.RuleVerificationReport`` collecting
+              machine-readable explanations for every item. On failure the
+              report retains all items and rules processed up to and including
+              the failing one.
+
+      link_provenance: (optional)
+              Mapping of item name to a ``rule_explainer.PROVENANCE_*`` string,
+              forwarded to the explainer.
+
+      artifact_filter: (optional)
+              Optional iterable of artifact paths restricting the detailed
+              per-artifact evidence in ``report``. Rules still run and consume
+              artifacts regardless of the filter.
+
     <Exceptions>
       None.
 
@@ -1180,11 +1241,25 @@ def verify_all_item_rules(items, links):
     for item in items:
         LOG.info("Verifying material rules for '%s'...", item.name)
         verify_item_rules(
-            item.name, "materials", item.expected_materials, links
+            item.name,
+            "materials",
+            item.expected_materials,
+            links,
+            report=report,
+            link_provenance=link_provenance,
+            artifact_filter=artifact_filter,
         )
 
         LOG.info("Verifying product rules for '%s'...", item.name)
-        verify_item_rules(item.name, "products", item.expected_products, links)
+        verify_item_rules(
+            item.name,
+            "products",
+            item.expected_products,
+            links,
+            report=report,
+            link_provenance=link_provenance,
+            artifact_filter=artifact_filter,
+        )
 
 
 def verify_threshold_constraints(layout, chain_link_dict):
@@ -1489,6 +1564,8 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
     step_name="",
     persist_inspection_links=True,
     inspect_timeout=in_toto.settings.LINK_CMD_EXEC_TIMEOUT,
+    report=None,
+    artifact_filter=None,
 ):
     """Performs complete in-toto supply chain verification for a final product.
 
@@ -1546,6 +1623,19 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
       inspect_timeout (optional): An integer value that defaults to
           in_toto.settings.LINK_CMD_EXEC_TIMEOUT in seconds which ends up timing
           out the run command subprocess if it runs over.
+
+      report (optional): A ``rule_explainer.RuleVerificationReport``. When
+          provided, machine-readable explanations of all step and inspection
+          artifact rules are appended to it. Step links that reached this point
+          have signature-verified provenance; inspection links are labeled as
+          locally generated. If verification fails, the report retains all
+          rules executed up to and including the failing rule.
+
+      artifact_filter (optional): An iterable of artifact paths. Restricts the
+          detailed per-artifact evidence in ``report`` to these paths. All
+          rules still run and consume artifacts; only queue snapshots remain
+          complete. Use this to avoid copying hashes of every artifact in large
+          layouts.
 
     Raises:
       securesystemslib.exceptions.FormatError: Passed parameters are malformed.
@@ -1619,7 +1709,20 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
     # inspection commands don't run on compromised target files, however, this
     # also precludes step match rules from referencing inspection artifacts.
     LOG.info("Verifying Step rules...")
-    verify_all_item_rules(layout.steps, reduced_chain_link_dict)
+    if report is not None:
+        step_provenance = {
+            name: in_toto.rule_explainer.PROVENANCE_SIGNATURE_VERIFIED
+            for name in reduced_chain_link_dict
+        }
+    else:
+        step_provenance = None
+    verify_all_item_rules(
+        layout.steps,
+        reduced_chain_link_dict,
+        report=report,
+        link_provenance=step_provenance,
+        artifact_filter=artifact_filter,
+    )
 
     LOG.info("Executing Inspection commands...")
     inspection_link_dict = run_all_inspections(
@@ -1631,7 +1734,21 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
     # Steps or Inspections, hence the concatenation of both collections of links
     combined_links = reduced_chain_link_dict.copy()
     combined_links.update(inspection_link_dict)
-    verify_all_item_rules(layout.inspect, combined_links)
+    if report is not None:
+        combined_provenance = dict(step_provenance)
+        for name in inspection_link_dict:
+            combined_provenance[
+                name
+            ] = in_toto.rule_explainer.PROVENANCE_INSPECTION
+    else:
+        combined_provenance = None
+    verify_all_item_rules(
+        layout.inspect,
+        combined_links,
+        report=report,
+        link_provenance=combined_provenance,
+        artifact_filter=artifact_filter,
+    )
 
     # We made it this far without exception that means, verification passed
     LOG.info("The software product passed all verification.")

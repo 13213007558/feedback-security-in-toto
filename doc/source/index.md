@@ -11,6 +11,7 @@ installing
 command-line-tools/index
 api
 model
+rule-explanations
 configuration
 layout-creation-example
 Demo Supply Chain <https://github.com/in-toto/demo>

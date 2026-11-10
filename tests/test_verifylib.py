@@ -21,6 +21,7 @@
 
 import copy
 import glob
+import json
 import os
 import shlex
 import shutil
@@ -52,6 +53,11 @@ from in_toto.models.layout import (
 )
 from in_toto.models.link import FILENAME_FORMAT, Link
 from in_toto.models.metadata import Metablock
+from in_toto.rule_explainer import (
+    PROVENANCE_INSPECTION,
+    PROVENANCE_SIGNATURE_VERIFIED,
+    RuleVerificationReport,
+)
 from in_toto.rulelib import unpack_rule
 from in_toto.verifylib import (
     _raise_on_bad_retval,
@@ -1055,6 +1061,94 @@ class TestInTotoVerify(unittest.TestCase, TmpDirMixin):
         layout = Metablock.load(self.layout_single_signed_path)
         layout_key_dict = {self.alice_pub["keyid"]: self.alice_pub}
         in_toto_verify(layout, layout_key_dict)
+
+    def test_verify_report_records_link_provenance(self):
+        """Report labels step links signature-verified and inspections local."""
+        layout = Metablock.load(self.layout_single_signed_path)
+        layout_key_dict = {self.alice_pub["keyid"]: self.alice_pub}
+        report = RuleVerificationReport()
+        in_toto_verify(layout, layout_key_dict, report=report)
+
+        # The report is JSON serializable and non-empty.
+        json.loads(report.to_json())
+        self.assertTrue(report.items)
+
+        provenances = {
+            (item.item_name, item.source_type): item.link_provenance
+            for item in report.items
+        }
+        step_names = {
+            step.name for step in layout.signed.steps
+        }
+        for item in report.items:
+            if item.item_name in step_names:
+                self.assertEqual(
+                    item.link_provenance,
+                    PROVENANCE_SIGNATURE_VERIFIED,
+                )
+                self.assertTrue(item.link_trusted)
+            else:
+                self.assertEqual(
+                    item.link_provenance, PROVENANCE_INSPECTION
+                )
+                self.assertFalse(item.link_trusted)
+        # At least one inspection explanation must be present.
+        self.assertTrue(
+            any(
+                provenance == PROVENANCE_INSPECTION
+                for provenance in provenances.values()
+            )
+        )
+
+    def test_verify_report_available_after_rule_failure(self):
+        """A failing rule leaves the partial report readable."""
+        layout = Metablock.load(self.layout_failing_step_rule_path)
+        layout_key_dict = {self.alice_pub["keyid"]: self.alice_pub}
+        report = RuleVerificationReport()
+        with self.assertRaises(RuleVerificationError):
+            in_toto_verify(layout, layout_key_dict, report=report)
+
+        # Partial results up to the failure are retained.
+        self.assertTrue(report.items)
+        failing_items = [item for item in report.items if item.failed]
+        self.assertTrue(failing_items)
+        failing_item = failing_items[-1]
+        self.assertTrue(failing_item.rule_explanations[-1].status == "failed")
+        json.loads(report.to_json())
+
+    def test_verify_report_artifact_filter(self):
+        """The filter limits evidence but verification still runs fully."""
+        layout = Metablock.load(self.layout_single_signed_path)
+        layout_key_dict = {self.alice_pub["keyid"]: self.alice_pub}
+        full_report = RuleVerificationReport()
+        in_toto_verify(layout, layout_key_dict, report=full_report)
+
+        filtered_report = RuleVerificationReport()
+        in_toto_verify(
+            layout,
+            layout_key_dict,
+            report=filtered_report,
+            artifact_filter=set(),
+        )
+        # Queue snapshots stay complete even with an empty evidence filter.
+        full_item = next(
+            item
+            for item in full_report.items
+            if item.rule_explanations
+        )
+        filtered_item = filtered_report.get_item(
+            full_item.item_name, full_item.source_type
+        )
+        self.assertEqual(
+            full_item.rule_explanations[0].queue_before,
+            filtered_item.rule_explanations[0].queue_before,
+        )
+        self.assertTrue(
+            all(
+                rule.judgments == [] and rule.matches == []
+                for rule in filtered_item.rule_explanations
+            )
+        )
 
     def test_verify_passing_double_signed_layout(self):
         """Test pass verification of double-signed layout."""
