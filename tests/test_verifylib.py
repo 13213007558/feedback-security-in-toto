@@ -39,9 +39,11 @@ import in_toto.exceptions
 import in_toto.settings
 from in_toto.exceptions import (
     BadReturnValueError,
+    BudgetExceededError,
     LayoutExpiredError,
     RuleVerificationError,
     SignatureVerificationError,
+    SublayoutCycleError,
     ThresholdVerificationError,
 )
 from in_toto.models.layout import (
@@ -54,6 +56,7 @@ from in_toto.models.link import FILENAME_FORMAT, Link
 from in_toto.models.metadata import Metablock
 from in_toto.rulelib import unpack_rule
 from in_toto.verifylib import (
+    VerificationBudget,
     _raise_on_bad_retval,
     get_summary_link,
     in_toto_verify,
@@ -1862,6 +1865,287 @@ class TestGetSummaryLink(unittest.TestCase, TmpDirMixin):
             sum_link.byproducts.get("return-value"),
             self.package_link.signed.byproducts.get("return-value"),
         )
+
+
+class TestInTotoVerifyBudget(unittest.TestCase, TmpDirMixin):
+    """Test verifylib.in_toto_verify with an optional VerificationBudget over
+    small sublayout delegation graphs: chain, diamond, cycle, and multiple
+    branches that jointly exhaust the budget."""
+
+    def setUp(self):
+        self.set_up_test_dir()
+        self.alice = SignerStore.rsa
+        self.alice_pub = SignerStore.rsa_pub
+        self.bob = SignerStore.ecdsa
+        self.bob_pub = SignerStore.ecdsa_pub
+        self.carl = SignerStore.ed25519
+        self.carl_pub = SignerStore.ed25519_pub
+        self.root_key_dict = {self.alice_pub["keyid"]: self.alice_pub}
+
+    def tearDown(self):
+        self.tear_down_test_dir()
+
+    @staticmethod
+    def _make_layout(signer, steps=None, inspect=None, keys=None):
+        """Return a signed layout Metablock."""
+        metadata = Metablock(
+            signed=Layout(
+                keys=keys or {}, steps=steps or [], inspect=inspect or []
+            )
+        )
+        metadata.create_signature(signer)
+        return metadata
+
+    @staticmethod
+    def _dump_as_link(metadata, step_name, keyid, dir_path="."):
+        """Dump layout metadata under the link filename format, so that the
+        superlayout loads it as evidence for the delegated step."""
+        filename = FILENAME_FORMAT.format(step_name=step_name, keyid=keyid)
+        metadata.dump(os.path.join(dir_path, filename))
+
+    def _build_chain(self):
+        """Build delegation chain root -> 'chain-b' -> 'chain-c' and return
+        the signed root layout."""
+        carl_metadata = self._make_layout(self.carl)
+        bob_metadata = self._make_layout(
+            self.bob,
+            steps=[Step(name="chain-c", pubkeys=[self.carl_pub["keyid"]])],
+            keys={self.carl_pub["keyid"]: self.carl_pub},
+        )
+        root_metadata = self._make_layout(
+            self.alice,
+            steps=[Step(name="chain-b", pubkeys=[self.bob_pub["keyid"]])],
+            keys={self.bob_pub["keyid"]: self.bob_pub},
+        )
+        self._dump_as_link(bob_metadata, "chain-b", self.bob_pub["keyid"])
+        sub_dir = SUBLAYOUT_LINK_DIR_FORMAT.format(
+            name="chain-b", keyid=self.bob_pub["keyid"]
+        )
+        os.mkdir(sub_dir)
+        self._dump_as_link(
+            carl_metadata, "chain-c", self.carl_pub["keyid"], sub_dir
+        )
+        return root_metadata
+
+    def _build_diamond(self):
+        """Build a root layout whose steps 'left' and 'right' both delegate to
+        the same sublayout evidence, dumped under two different step names."""
+        shared_metadata = self._make_layout(self.bob)
+        root_metadata = self._make_layout(
+            self.alice,
+            steps=[
+                Step(name="left", pubkeys=[self.bob_pub["keyid"]]),
+                Step(name="right", pubkeys=[self.bob_pub["keyid"]]),
+            ],
+            keys={self.bob_pub["keyid"]: self.bob_pub},
+        )
+        self._dump_as_link(shared_metadata, "left", self.bob_pub["keyid"])
+        self._dump_as_link(shared_metadata, "right", self.bob_pub["keyid"])
+        return root_metadata
+
+    def _build_inspection_branches(self):
+        """Build a root layout that delegates 'branch-b' and 'branch-c' to
+        sublayouts with two inspections each."""
+        bob_metadata = self._make_layout(
+            self.bob,
+            inspect=[
+                Inspection(name="bob-inspect-1", run=["true"]),
+                Inspection(name="bob-inspect-2", run=["true"]),
+            ],
+        )
+        carl_metadata = self._make_layout(
+            self.carl,
+            inspect=[
+                Inspection(name="carl-inspect-1", run=["true"]),
+                Inspection(name="carl-inspect-2", run=["true"]),
+            ],
+        )
+        root_metadata = self._make_layout(
+            self.alice,
+            steps=[
+                Step(name="branch-b", pubkeys=[self.bob_pub["keyid"]]),
+                Step(name="branch-c", pubkeys=[self.carl_pub["keyid"]]),
+            ],
+            keys={
+                self.bob_pub["keyid"]: self.bob_pub,
+                self.carl_pub["keyid"]: self.carl_pub,
+            },
+        )
+        self._dump_as_link(bob_metadata, "branch-b", self.bob_pub["keyid"])
+        self._dump_as_link(carl_metadata, "branch-c", self.carl_pub["keyid"])
+        return root_metadata
+
+    @staticmethod
+    def _inspection_stub(run_calls):
+        """Return a controlled in_toto_run substitute that records the names
+        of the inspections it is asked to execute."""
+
+        def fake_in_toto_run(name, *args, **kwargs):
+            run_calls.append(name)
+            link = Link()
+            link.name = name
+            link.byproducts = {"return-value": 0}
+            return Metablock(signed=link)
+
+        return fake_in_toto_run
+
+    def test_budget_rejects_invalid_limits(self):
+        """Budget limits must be non-negative ints or None."""
+        with self.assertRaises(ValueError):
+            VerificationBudget(max_depth=-1)
+        with self.assertRaises(ValueError):
+            VerificationBudget(max_metadata="10")
+        with self.assertRaises(ValueError):
+            VerificationBudget(max_inspections=1.5)
+
+    def test_chain_within_budget(self):
+        """A delegation chain that fits the budget verifies successfully."""
+        root_metadata = self._build_chain()
+        budget = VerificationBudget(
+            max_depth=2, max_metadata=2, max_inspections=0
+        )
+        summary_link = in_toto_verify(
+            root_metadata, self.root_key_dict, budget=budget
+        )
+        self.assertIsInstance(summary_link, Link)
+        self.assertEqual(budget.metadata_reads, 2)
+        self.assertEqual(budget.inspection_runs, 0)
+
+    def test_chain_depth_limit_reports_delegation_path(self):
+        """Exceeding the depth budget aborts verification and reports the
+        delegation path of the rejected sublayout."""
+        root_metadata = self._build_chain()
+        budget = VerificationBudget(max_depth=1)
+        with self.assertRaises(BudgetExceededError) as raise_ctx:
+            in_toto_verify(root_metadata, self.root_key_dict, budget=budget)
+        exception_msg = str(raise_ctx.exception)
+        self.assertIn("chain-b", exception_msg)
+        self.assertIn("chain-c", exception_msg)
+
+    def test_chain_metadata_limit_is_shared_across_sublayouts(self):
+        """The metadata budget is not reset when recursing: the root layout's
+        read counts against the sublayout's allowance."""
+        root_metadata = self._build_chain()
+        budget = VerificationBudget(max_metadata=1)
+        with self.assertRaises(BudgetExceededError) as raise_ctx:
+            in_toto_verify(root_metadata, self.root_key_dict, budget=budget)
+        self.assertIn("chain-b", str(raise_ctx.exception))
+        # Only the budgeted metadata file was read, the second read of the
+        # chain never happened.
+        self.assertEqual(budget.metadata_reads, 1)
+
+    def test_diamond_reuse_is_not_a_cycle(self):
+        """Reusing the same sublayout evidence from two different branches of
+        the delegation graph is legitimate and verifies successfully."""
+        root_metadata = self._build_diamond()
+        budget = VerificationBudget(max_depth=1, max_metadata=2)
+        in_toto_verify(root_metadata, self.root_key_dict, budget=budget)
+        self.assertEqual(budget.metadata_reads, 2)
+
+    def test_diamond_shares_metadata_budget(self):
+        """Both branches of the diamond draw from the same metadata budget."""
+        root_metadata = self._build_diamond()
+        budget = VerificationBudget(max_metadata=1)
+        with self.assertRaises(BudgetExceededError):
+            in_toto_verify(root_metadata, self.root_key_dict, budget=budget)
+        self.assertEqual(budget.metadata_reads, 1)
+
+    def test_self_delegation_cycle(self):
+        """A layout that delegates a step to its own evidence is rejected as
+        a cycle, even though all signatures verify."""
+        layout_metadata = self._make_layout(
+            self.bob,
+            steps=[Step(name="loop", pubkeys=[self.bob_pub["keyid"]])],
+            keys={self.bob_pub["keyid"]: self.bob_pub},
+        )
+        self._dump_as_link(layout_metadata, "loop", self.bob_pub["keyid"])
+        with self.assertRaises(SublayoutCycleError) as raise_ctx:
+            in_toto_verify(
+                layout_metadata,
+                {self.bob_pub["keyid"]: self.bob_pub},
+                budget=VerificationBudget(max_depth=10, max_metadata=100),
+            )
+        self.assertIn("loop", str(raise_ctx.exception))
+
+    def test_mutual_delegation_cycle(self):
+        """A -> B -> A is detected as a cycle along the delegation path."""
+        alice_metadata = self._make_layout(
+            self.alice,
+            steps=[Step(name="to-b", pubkeys=[self.bob_pub["keyid"]])],
+            keys={self.bob_pub["keyid"]: self.bob_pub},
+        )
+        bob_metadata = self._make_layout(
+            self.bob,
+            steps=[Step(name="to-a", pubkeys=[self.alice_pub["keyid"]])],
+            keys={self.alice_pub["keyid"]: self.alice_pub},
+        )
+        self._dump_as_link(bob_metadata, "to-b", self.bob_pub["keyid"])
+        sub_dir = SUBLAYOUT_LINK_DIR_FORMAT.format(
+            name="to-b", keyid=self.bob_pub["keyid"]
+        )
+        os.mkdir(sub_dir)
+        self._dump_as_link(
+            alice_metadata, "to-a", self.alice_pub["keyid"], sub_dir
+        )
+        with self.assertRaises(SublayoutCycleError) as raise_ctx:
+            in_toto_verify(alice_metadata, self.root_key_dict)
+        exception_msg = str(raise_ctx.exception)
+        self.assertIn("to-a", exception_msg)
+        self.assertIn("to-b", exception_msg)
+
+    def test_inspections_within_budget(self):
+        """All inspections run if the shared inspection budget suffices."""
+        root_metadata = self._build_inspection_branches()
+        run_calls = []
+        budget = VerificationBudget(max_inspections=4)
+        with patch(
+            "in_toto.runlib.in_toto_run",
+            side_effect=self._inspection_stub(run_calls),
+        ):
+            in_toto_verify(
+                root_metadata,
+                self.root_key_dict,
+                persist_inspection_links=False,
+                budget=budget,
+            )
+        self.assertEqual(
+            run_calls,
+            [
+                "bob-inspect-1",
+                "bob-inspect-2",
+                "carl-inspect-1",
+                "carl-inspect-2",
+            ],
+        )
+
+    def test_branches_jointly_exhaust_inspection_budget(self):
+        """Both delegation branches draw from one inspection budget. When it
+        is exhausted, verification aborts (instead of skipping the branch and
+        declaring success) and the over-budget command is never started."""
+        root_metadata = self._build_inspection_branches()
+        run_calls = []
+        budget = VerificationBudget(max_inspections=3)
+        with (
+            patch(
+                "in_toto.runlib.in_toto_run",
+                side_effect=self._inspection_stub(run_calls),
+            ),
+            self.assertRaises(BudgetExceededError) as raise_ctx,
+        ):
+            in_toto_verify(
+                root_metadata,
+                self.root_key_dict,
+                persist_inspection_links=False,
+                budget=budget,
+            )
+        # The fourth inspection was rejected before its command started.
+        self.assertEqual(
+            run_calls, ["bob-inspect-1", "bob-inspect-2", "carl-inspect-1"]
+        )
+        # The error names the rejected work and its delegation path.
+        exception_msg = str(raise_ctx.exception)
+        self.assertIn("carl-inspect-2", exception_msg)
+        self.assertIn("branch-c", exception_msg)
 
 
 if __name__ == "__main__":

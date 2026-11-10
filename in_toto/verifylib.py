@@ -27,6 +27,7 @@
 
 import datetime
 import fnmatch
+import hashlib
 import logging
 import os
 
@@ -44,9 +45,11 @@ import in_toto.runlib
 import in_toto.settings
 from in_toto.exceptions import (
     BadReturnValueError,
+    BudgetExceededError,
     LayoutExpiredError,
     RuleVerificationError,
     SignatureVerificationError,
+    SublayoutCycleError,
     ThresholdVerificationError,
 )
 from in_toto.formats import _check_parameter_dict, _check_public_keys
@@ -56,6 +59,124 @@ from in_toto.models.metadata import Metadata
 LOG = logging.getLogger(__name__)
 
 RULE_TRACE = {}
+
+
+class VerificationBudget:
+    """Optional work budget for one full in-toto verification run.
+
+    A single budget instance is shared by one ``in_toto_verify`` call and all
+    recursive sublayout verifications it triggers, so that the limits below
+    constrain the total work of the whole verification, including nested
+    delegations. Counters are never reset when recursing into a sublayout.
+
+    Each limit may be None to leave the corresponding dimension unconstrained:
+
+    - max_depth: Maximum sublayout nesting depth. The layout passed to
+      ``in_toto_verify`` is at depth 0, so ``max_depth=0`` rejects any
+      sublayout delegation.
+    - max_metadata: Maximum total number of link or layout metadata files
+      read from disk.
+    - max_inspections: Maximum total number of inspection commands executed.
+
+    Work is checked before it is started: if a limit is exhausted, a
+    ``BudgetExceededError`` naming the current delegation path is raised and
+    the pending file read or inspection command is not performed.
+    """
+
+    def __init__(
+        self, max_depth=None, max_metadata=None, max_inspections=None
+    ):
+        for limit_name, limit in [
+            ("max_depth", max_depth),
+            ("max_metadata", max_metadata),
+            ("max_inspections", max_inspections),
+        ]:
+            if limit is not None and (
+                not isinstance(limit, int) or limit < 0
+            ):
+                raise ValueError(
+                    f"'{limit_name}' must be a non-negative int or None,"
+                    f" got '{limit}'."
+                )
+
+        self.max_depth = max_depth
+        self.max_metadata = max_metadata
+        self.max_inspections = max_inspections
+        self.metadata_reads = 0
+        self.inspection_runs = 0
+
+    def check_depth(self, depth, delegation_path):
+        """Raise BudgetExceededError if depth exceeds max_depth."""
+        if self.max_depth is not None and depth > self.max_depth:
+            raise BudgetExceededError(
+                f"Verification budget exhausted: sublayout depth limit"
+                f" '{self.max_depth}' exceeded at delegation path"
+                f" '{_format_delegation_path(delegation_path)}'."
+            )
+
+    def check_metadata_read(self, delegation_path):
+        """Raise BudgetExceededError if no further metadata file may be
+        read. Call before reading a metadata file from disk."""
+        if (
+            self.max_metadata is not None
+            and self.metadata_reads >= self.max_metadata
+        ):
+            raise BudgetExceededError(
+                f"Verification budget exhausted: metadata read limit"
+                f" '{self.max_metadata}' reached at delegation path"
+                f" '{_format_delegation_path(delegation_path)}'."
+            )
+
+    def record_metadata_read(self):
+        """Record one successfully read metadata file."""
+        self.metadata_reads += 1
+
+    def consume_inspection(self, inspection_name, delegation_path):
+        """Raise BudgetExceededError if no further inspection may run,
+        otherwise record the inspection. Call before running the inspection
+        command."""
+        if (
+            self.max_inspections is not None
+            and self.inspection_runs >= self.max_inspections
+        ):
+            raise BudgetExceededError(
+                f"Verification budget exhausted: inspection limit"
+                f" '{self.max_inspections}' reached before running inspection"
+                f" '{inspection_name}' at delegation path"
+                f" '{_format_delegation_path(delegation_path)}'."
+            )
+        self.inspection_runs += 1
+
+
+def _layout_evidence_digest(metadata):
+    """Return a digest identifying the passed layout metadata, used to
+    detect delegation cycles along the active delegation path."""
+    canonical = securesystemslib.formats.encode_canonical(metadata.to_dict())
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _format_delegation_path(delegation_path):
+    """Format a delegation path (sequence of (label, digest) pairs) for
+    error messages."""
+    return " -> ".join(label for label, _ in delegation_path)
+
+
+def _check_sublayout_cycle(evidence_digest, label, ancestor_path):
+    """Raise SublayoutCycleError if the passed layout evidence digest already
+    appears among the ancestors on the current delegation path.
+
+    Only ancestors along the active delegation path are considered, so
+    reusing the same sublayout from different branches of the delegation
+    graph remains legitimate.
+    """
+    for ancestor_label, ancestor_digest in ancestor_path:
+        if ancestor_digest == evidence_digest:
+            full_path = ancestor_path + ((label, evidence_digest),)
+            raise SublayoutCycleError(
+                f"Delegation cycle detected: layout evidence delegated at"
+                f" '{label}' was already seen at '{ancestor_label}' in"
+                f" delegation path '{_format_delegation_path(full_path)}'."
+            )
 
 
 def _raise_on_bad_retval(return_value, command=None):
@@ -97,7 +218,9 @@ def _raise_on_bad_retval(return_value, command=None):
         raise BadReturnValueError(msg.format(what="zero"))
 
 
-def load_links_for_layout(layout, link_dir_path):
+def load_links_for_layout(
+    layout, link_dir_path, budget=None, delegation_path=()
+):
     """
     <Purpose>
       Try to load all existing metadata files for each Step of the Layout
@@ -113,6 +236,15 @@ def load_links_for_layout(layout, link_dir_path):
       link_dir_path:
             A path to directory where links are loaded from
 
+      budget: (optional)
+            A VerificationBudget shared with the enclosing verification. If
+            passed, each metadata file read is checked against and counted
+            towards the budget before the file is loaded.
+
+      delegation_path: (optional)
+            The delegation path of the enclosing verification, used in budget
+            error messages.
+
 
     <Side Effects>
       Calls function to read files from disk
@@ -121,6 +253,9 @@ def load_links_for_layout(layout, link_dir_path):
       in_toto.exceptions.LinkNotFoundError,
               if fewer than `threshold` link files can be found for any given
               step of the supply chain (preliminary threshold check)
+
+      in_toto.exceptions.BudgetExceededError,
+              if the passed budget's metadata read limit is exhausted
 
     <Returns>
       A dictionary carrying all the found metadata corresponding to the
@@ -155,7 +290,13 @@ def load_links_for_layout(layout, link_dir_path):
                 filepath = os.path.join(link_dir_path, filename)
 
                 try:
+                    # Refuse to read more metadata than the budget allows.
+                    # The read is only recorded if the file actually exists.
+                    if budget is not None:
+                        budget.check_metadata_read(delegation_path)
                     metadata = Metadata.load(filepath)
+                    if budget is not None:
+                        budget.record_metadata_read()
                     links_per_step[keyid] = metadata
 
                 except OSError:
@@ -179,6 +320,8 @@ def run_all_inspections(
     layout,
     persist_inspection_links,
     timeout=in_toto.settings.LINK_CMD_EXEC_TIMEOUT,
+    budget=None,
+    delegation_path=(),
 ):
     """
     <Purpose>
@@ -200,9 +343,21 @@ def run_all_inspections(
               Integer that is the amount of seconds that the inspection run will
               fail after.
 
+      budget: (optional)
+              A VerificationBudget shared with the enclosing verification. If
+              passed, each inspection is checked against and counted towards
+              the budget before its command is executed.
+
+      delegation_path: (optional)
+              The delegation path of the enclosing verification, used in budget
+              error messages.
+
     <Exceptions>
       Calls function that raises BadReturnValueError if an inspection returned
       non-int or non-zero.
+
+      in_toto.exceptions.BudgetExceededError,
+              if the passed budget's inspection limit is exhausted
 
     <Returns>
       A dictionary of metadata about the executed inspections, e.g.:
@@ -218,6 +373,11 @@ def run_all_inspections(
     inspection_links_dict = {}
     for inspection in layout.inspect:
         LOG.info("Executing command for inspection '%s'...", inspection.name)
+
+        # Refuse to run more inspection commands than the budget allows. The
+        # inspection is only counted once its command may actually start.
+        if budget is not None:
+            budget.consume_inspection(inspection.name, delegation_path)
 
         # FIXME: We don't want to use the base path for runlib so we patch this
         # for now. This will not stay!
@@ -1324,7 +1484,12 @@ def reduce_chain_links(chain_link_dict):
 
 
 def verify_sublayouts(
-    layout, steps_metadata, superlayout_link_dir_path, inspect_timeout
+    layout,
+    steps_metadata,
+    superlayout_link_dir_path,
+    inspect_timeout,
+    budget=None,
+    delegation_path=(),
 ):
     """
     <Purpose>
@@ -1357,6 +1522,15 @@ def verify_sublayouts(
       inspect_timeout:
               Integer value that is the number of seconds to pass to the run
               command to timeout the subprocess within.
+
+      budget: (optional)
+              A VerificationBudget shared with the enclosing verification,
+              passed on to recursive sublayout verification calls.
+
+      delegation_path: (optional)
+              The delegation path of the enclosing verification, extended and
+              passed on to recursive sublayout verification calls for cycle
+              detection and budget error messages.
 
     <Exceptions>
       raises an Exception if verification of the delegated step fails.
@@ -1406,13 +1580,17 @@ def verify_sublayouts(
                 )
 
                 # Make a recursive call to in_toto_verify with the
-                # layout and the extracted key object
+                # layout and the extracted key object. The budget and the
+                # delegation path are shared with (not reset for) the
+                # sublayout verification.
                 summary_link = in_toto_verify(
                     metadata,
                     layout_key_dict,
                     link_dir_path=sublayout_link_dir_path,
                     step_name=step_name,
                     inspect_timeout=inspect_timeout,
+                    budget=budget,
+                    _delegation_path=delegation_path,
                 )
 
                 # Replace the layout object with the link object returned
@@ -1489,6 +1667,8 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
     step_name="",
     persist_inspection_links=True,
     inspect_timeout=in_toto.settings.LINK_CMD_EXEC_TIMEOUT,
+    budget=None,
+    _delegation_path=(),
 ):
     """Performs complete in-toto supply chain verification for a final product.
 
@@ -1547,6 +1727,19 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
           in_toto.settings.LINK_CMD_EXEC_TIMEOUT in seconds which ends up timing
           out the run command subprocess if it runs over.
 
+      budget (optional): A VerificationBudget that constrains the total amount
+          of work (sublayout nesting depth, metadata files read, inspection
+          commands executed) performed by this verification and all recursive
+          sublayout verifications. The same budget object is shared across all
+          recursion levels; counters are not reset per sublayout. If omitted,
+          the amount of work is not constrained.
+
+      _delegation_path (optional): Internal tuple of (label, evidence digest)
+          pairs identifying the chain of delegations from the root layout to
+          the currently verified layout. Used to detect delegation cycles and
+          to report the delegation path in budget errors. Callers should not
+          pass this argument.
+
     Raises:
       securesystemslib.exceptions.FormatError: Passed parameters are malformed.
 
@@ -1569,6 +1762,13 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
 
       BadReturnValueError: An inspection command returns a non-zero value.
 
+      BudgetExceededError: The passed work budget is exhausted. Verification
+          aborts instead of skipping the affected delegation branch.
+
+      SublayoutCycleError: The same layout evidence is delegated again along
+          the current delegation path. Reusing the same sublayout from
+          different branches of the delegation graph is not a cycle.
+
     Side Effects:
       Reads link metadata files from disk.
       Runs inspection commands in subprocess.
@@ -1579,6 +1779,20 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
       verification.
 
     """
+
+    # Identify the currently verified layout evidence and refuse to re-enter
+    # evidence that already appears on the active delegation path (cycle).
+    # Reusing the same sublayout from different branches is legitimate and
+    # not rejected, as only ancestors on the current path are considered.
+    current_label = step_name or "<root>"
+    evidence_digest = _layout_evidence_digest(metadata)
+    _check_sublayout_cycle(evidence_digest, current_label, _delegation_path)
+    delegation_path = _delegation_path + ((current_label, evidence_digest),)
+
+    # Refuse to descend deeper than the budget allows, before doing any work
+    # (signature verification, metadata reads, inspections) for this layout.
+    if budget is not None:
+        budget.check_depth(len(_delegation_path), delegation_path)
 
     LOG.info("Verifying layout metadata signatures...")
     verify_metadata_signatures(metadata, layout_key_dict)
@@ -1598,14 +1812,21 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
         substitute_parameters(layout, substitution_parameters)
 
     LOG.info("Reading link metadata files...")
-    steps_metadata = load_links_for_layout(layout, link_dir_path)
+    steps_metadata = load_links_for_layout(
+        layout, link_dir_path, budget=budget, delegation_path=delegation_path
+    )
 
     LOG.info("Verifying link metadata signatures...")
     steps_metadata = verify_link_signature_thresholds(layout, steps_metadata)
 
     LOG.info("Verifying sublayouts...")
     chain_link_dict = verify_sublayouts(
-        layout, steps_metadata, link_dir_path, inspect_timeout
+        layout,
+        steps_metadata,
+        link_dir_path,
+        inspect_timeout,
+        budget=budget,
+        delegation_path=delegation_path,
     )
 
     LOG.info("Verifying alignment of reported commands...")
@@ -1623,7 +1844,11 @@ def in_toto_verify(  # noqa: PLR0913, PLR0917, RUF100
 
     LOG.info("Executing Inspection commands...")
     inspection_link_dict = run_all_inspections(
-        layout, persist_inspection_links, inspect_timeout
+        layout,
+        persist_inspection_links,
+        inspect_timeout,
+        budget=budget,
+        delegation_path=delegation_path,
     )
 
     LOG.info("Verifying Inspection rules...")

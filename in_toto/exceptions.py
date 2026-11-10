@@ -31,6 +31,15 @@ class LinkNotFoundError(Error):
     """Indicates that a link file was not found."""
 
 
+class BudgetExceededError(Error):
+    """Indicates that a verification work budget was exhausted."""
+
+
+class SublayoutCycleError(Error):
+    """Indicates that the same layout evidence recurs along the current
+    sublayout delegation path."""
+
+
 class UnsupportedKeyTypeError(Error):
     """Indicates that the specified key type is not yet supported."""
 
