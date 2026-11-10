@@ -11,6 +11,7 @@ installing
 command-line-tools/index
 api
 model
+approval-gate
 configuration
 layout-creation-example
 Demo Supply Chain <https://github.com/in-toto/demo>

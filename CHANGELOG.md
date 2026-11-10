@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+* Two-phase inspection verification with a local approval gate
+  (`in_toto.approval`): plans list the in-order inspection argument arrays,
+  working directory constraints and artifact rules for the top-level layout
+  and every expanded sublayout, bind approvals to raw layout byte digests,
+  trusted key configuration and substitution parameters, and re-check all
+  bindings and expiration before executing any inspection command
+
 ## v3.1.0
 
 This release includes version bumpbs, as well as upgraded debian support , and

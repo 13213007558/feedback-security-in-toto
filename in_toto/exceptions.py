@@ -41,3 +41,8 @@ class PrefixError(Error):
 
 class InvalidMetadata(Error):  # noqa: N818
     """Indicates that the metadata is not valid."""
+
+
+class ApprovalError(Error):
+    """Indicates that an inspection plan was not approved or that an approval
+    is no longer valid at execution time."""
