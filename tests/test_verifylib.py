@@ -25,6 +25,7 @@ import os
 import shlex
 import shutil
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
@@ -37,6 +38,7 @@ from securesystemslib._gpg.exceptions import KeyExpirationError
 
 import in_toto.exceptions
 import in_toto.settings
+import in_toto.verifylib
 from in_toto.exceptions import (
     BadReturnValueError,
     LayoutExpiredError,
@@ -494,6 +496,15 @@ class TestVerifyRule(unittest.TestCase):
             if exception and not should_raise:
                 self.fail(f"Unexpected {exception}\n{msg}")
 
+    def test_verify_require_rule_without_item_context(self):
+        """Direct call raises RuleVerificationError with rule and artifact
+        info, even without verify_item_rules trace context."""
+        with self.assertRaises(RuleVerificationError) as ctx:
+            verify_require_rule("foo", {"bar"})
+        message = str(ctx.exception)
+        self.assertIn("'REQUIRE foo' did not find foo in: {'bar'}", message)
+        self.assertNotIn("Full trace", message)
+
 
 class TestVerifyMatchRule(unittest.TestCase):
     """Test verifylib.verify_match_rule(rule, artifact_queue, artifacts, links)"""
@@ -806,6 +817,127 @@ class TestVerifyItemRules(unittest.TestCase):
         ]
         with self.assertRaises(RuleVerificationError):
             verify_item_rules(self.item_name, "materials", rules, self.links)
+
+    def test_fail_disallow_traceback_isolated_between_threads(self):
+        """Interleaved failing DISALLOW rules in two threads must each report
+        their own step, rule and remaining artifacts."""
+        links = {}
+        for step in ("step-a", "step-b"):
+            prefix = step[-1]
+            links[step] = Link(
+                name=step,
+                materials={f"{prefix}-src": {"sha256": self.sha256_1}},
+                products={
+                    f"{prefix}-out": {"sha256": self.sha256_1},
+                    f"{prefix}-left": {"sha256": self.sha256_1},
+                },
+            )
+
+        barrier = threading.Barrier(2)
+        original_traceback = in_toto.verifylib._get_artifact_rule_traceback
+
+        def synchronized_traceback():
+            # Force both threads to build their diagnostics only after both
+            # have populated their rule traces.
+            barrier.wait(timeout=10)
+            return original_traceback()
+
+        errors = {}
+
+        def run(step):
+            prefix = step[-1]
+            rules = [["ALLOW", f"{prefix}-out"], ["DISALLOW", "*"]]
+            try:
+                verify_item_rules(step, "products", rules, links)
+            except RuleVerificationError as e:
+                errors[step] = str(e)
+
+        with patch(
+            "in_toto.verifylib._get_artifact_rule_traceback",
+            synchronized_traceback,
+        ):
+            threads = [
+                threading.Thread(target=run, args=(step,))
+                for step in ("step-a", "step-b")
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(set(errors), {"step-a", "step-b"})
+        for step in ("step-a", "step-b"):
+            prefix = step[-1]
+            message = errors[step]
+            self.assertIn(
+                f"'DISALLOW *' matched the following artifacts: ['{prefix}-left']",
+                message,
+            )
+            self.assertIn(
+                f"Full trace for 'expected_products' of item '{step}'", message
+            )
+            self.assertIn(
+                f"Queue after 'ALLOW {prefix}-out':\n['{prefix}-left']", message
+            )
+            other_step = "step-b" if step == "step-a" else "step-a"
+            self.assertNotIn(other_step, message)
+
+    def test_rule_trace_does_not_leak_into_later_errors(self):
+        """A failed verification must not leak its trace into later errors,
+        and a caught exception's message must stay stable."""
+        rules = [["DISALLOW", "*"]]
+        with self.assertRaises(RuleVerificationError) as ctx:
+            verify_item_rules(self.item_name, "materials", rules, self.links)
+        message = str(ctx.exception)
+        self.assertIn(f"of item '{self.item_name}'", message)
+
+        # A later failing verification must not modify the caught exception
+        with self.assertRaises(RuleVerificationError):
+            verify_item_rules(self.item_name, "products", rules, self.links)
+        self.assertEqual(str(ctx.exception), message)
+
+        # A direct rule call raises the original RuleVerificationError
+        # without stale trace info from the verifications above
+        with self.assertRaises(RuleVerificationError) as ctx:
+            verify_disallow_rule("*", {"other"})
+        self.assertIn(
+            "'DISALLOW *' matched the following artifacts: ['other']",
+            str(ctx.exception),
+        )
+        self.assertNotIn(self.item_name, str(ctx.exception))
+        self.assertNotIn("Full trace", str(ctx.exception))
+
+    def test_nested_verification_preserves_outer_trace(self):
+        """A nested verify_item_rules call must not clobber the outer trace."""
+        self.links["inner"] = Link(
+            name="inner",
+            materials={"x": {"sha256": self.sha256_1}},
+            products={},
+        )
+
+        original_allow_rule = in_toto.verifylib.verify_allow_rule
+
+        def nested_allow_rule(pattern, queue):
+            # Trigger a nested verification while the outer one is in progress
+            verify_item_rules(
+                "inner", "materials", [["REQUIRE", "x"]], self.links
+            )
+            return original_allow_rule(pattern, queue)
+
+        with patch(
+            "in_toto.verifylib.verify_allow_rule", nested_allow_rule
+        ):
+            with self.assertRaises(RuleVerificationError) as ctx:
+                verify_item_rules(
+                    self.item_name,
+                    "materials",
+                    [["ALLOW", "foo"], ["DISALLOW", "*"]],
+                    self.links,
+                )
+
+        message = str(ctx.exception)
+        self.assertIn(f"of item '{self.item_name}'", message)
+        self.assertNotIn("inner", message)
 
     def test_fail_wrong_source_type(self):
         """Fail with wrong source_type."""

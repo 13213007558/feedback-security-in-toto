@@ -25,6 +25,7 @@
 
 """
 
+import contextvars
 import datetime
 import fnmatch
 import logging
@@ -55,7 +56,11 @@ from in_toto.models.metadata import Metadata
 # Inherits from in_toto base logger (c.f. in_toto.log)
 LOG = logging.getLogger(__name__)
 
-RULE_TRACE = {}
+# Per-context artifact rule trace, used to build rich RuleVerificationError
+# messages. A ContextVar (instead of a shared global dict) keeps the trace
+# isolated between threads and between nested verification calls, so
+# diagnostics always describe the verification that actually failed.
+RULE_TRACE = contextvars.ContextVar("in_toto_rule_trace", default=None)
 
 
 def _raise_on_bad_retval(return_value, command=None):
@@ -985,12 +990,19 @@ def verify_require_rule(filename, artifacts_queue):
 
 
 def _get_artifact_rule_traceback():
-    """Build and return string form global `RULE_TRACE` which may be used as
-    error message for RuleVerificationError.
+    """Build and return string form of the current context's `RULE_TRACE`,
+    which may be used as error message for RuleVerificationError.
+
+    Returns an empty string if no trace is available, e.g. when a rule
+    verification function is called directly, outside of `verify_item_rules`.
 
     """
+    rule_trace = RULE_TRACE.get()
+    if rule_trace is None:
+        return ""
+
     traceback_str = "Full trace for 'expected_{}' of item '{}':\n".format(
-        RULE_TRACE["source_type"], RULE_TRACE["source_name"]
+        rule_trace["source_type"], rule_trace["source_name"]
     )
 
     # Show all materials and products available in the beginning and
@@ -998,11 +1010,11 @@ def _get_artifact_rule_traceback():
     for source_type in ["materials", "products"]:
         traceback_str += "Available {}{}:\n{}\n".format(
             source_type,
-            [" (used for queue)", ""][RULE_TRACE["source_type"] != source_type],
-            RULE_TRACE[source_type],
+            [" (used for queue)", ""][rule_trace["source_type"] != source_type],
+            rule_trace[source_type],
         )
 
-    for trace_entry in RULE_TRACE["trace"]:
+    for trace_entry in rule_trace["trace"]:
         traceback_str += "Queue after '{}':\n".format(
             " ".join(trace_entry["rule"])
         )
@@ -1064,7 +1076,8 @@ def verify_item_rules(source_name, source_type, rules, links):
           if a REQUIRE rule does not find a required artifact.
 
     <Side Effects>
-      Clears and populates the global RULE_TRACE data structure.
+      Sets the context-local RULE_TRACE data structure for the duration of
+      the call and restores the previous value on exit.
 
     """
     if source_type not in {"materials", "products"}:
@@ -1088,69 +1101,76 @@ def verify_item_rules(source_name, source_type, rules, links):
     artifacts = getattr(links[source_name], source_type)
     artifacts_queue = set(artifacts.keys())
 
-    # Reset and re-populate rule traceback info dict for a rich error message
-    RULE_TRACE.clear()
-    RULE_TRACE["source_name"] = source_name
-    RULE_TRACE["source_type"] = source_type
-    RULE_TRACE["materials"] = list(materials_dict)
-    RULE_TRACE["products"] = list(products_dict)
-    RULE_TRACE["trace"] = []
+    # Populate a fresh, context-local rule traceback info dict for a rich error
+    # message. The token is used to restore any outer trace (e.g. of a nested
+    # verification) when this call returns or raises.
+    rule_trace = {
+        "source_name": source_name,
+        "source_type": source_type,
+        "materials": list(materials_dict),
+        "products": list(products_dict),
+        "trace": [],
+    }
+    rule_trace_token = RULE_TRACE.set(rule_trace)
 
-    # Process rules and remove consumed items from queue in each iteration
-    for rule in rules:
-        LOG.info("Verifying '%s'...", " ".join(rule))
+    try:
+        # Process rules and remove consumed items from queue in each iteration
+        for rule in rules:
+            LOG.info("Verifying '%s'...", " ".join(rule))
 
-        # Parse the rule and create two shortcuts to contained rule data
-        rule_data = in_toto.rulelib.unpack_rule(rule)
-        _type = rule_data["rule_type"]
-        pattern = rule_data["pattern"]
+            # Parse the rule and create two shortcuts to contained rule data
+            rule_data = in_toto.rulelib.unpack_rule(rule)
+            _type = rule_data["rule_type"]
+            pattern = rule_data["pattern"]
 
-        # Initialize empty consumed set as fallback for rules that do not consume
-        # artifacts. All rules except "disallow" and "require" consume artifacts.
-        consumed = set()
+            # Initialize empty consumed set as fallback for rules that do not consume
+            # artifacts. All rules except "disallow" and "require" consume artifacts.
+            consumed = set()
 
-        if _type == "match":
-            consumed = verify_match_rule(
-                rule_data, artifacts_queue, artifacts, links
+            if _type == "match":
+                consumed = verify_match_rule(
+                    rule_data, artifacts_queue, artifacts, links
+                )
+
+            elif _type == "create":
+                consumed = verify_create_rule(
+                    pattern, artifacts_queue, materials_paths, products_paths
+                )
+
+            elif _type == "delete":
+                consumed = verify_delete_rule(
+                    pattern, artifacts_queue, materials_paths, products_paths
+                )
+
+            elif _type == "modify":
+                consumed = verify_modify_rule(
+                    pattern, artifacts_queue, materials_dict, products_dict
+                )
+
+            elif _type == "allow":
+                consumed = verify_allow_rule(pattern, artifacts_queue)
+
+            # It's up to the "disallow" and "require" rule to raise an error if
+            # artifacts were not consumed as intended
+            elif _type == "disallow":
+                verify_disallow_rule(pattern, artifacts_queue)
+
+            elif _type == "require":
+                verify_require_rule(pattern, artifacts_queue)
+
+            else:  # pragma: no cover (unreachable)
+                raise securesystemslib.exceptions.FormatError(
+                    f"Invaldid rule type '{_type}'."
+                )
+
+            artifacts_queue -= consumed
+
+            # Append rule and copy of queue to trace info for a rich error message
+            rule_trace["trace"].append(
+                {"rule": list(rule), "queue": list(artifacts_queue)}
             )
-
-        elif _type == "create":
-            consumed = verify_create_rule(
-                pattern, artifacts_queue, materials_paths, products_paths
-            )
-
-        elif _type == "delete":
-            consumed = verify_delete_rule(
-                pattern, artifacts_queue, materials_paths, products_paths
-            )
-
-        elif _type == "modify":
-            consumed = verify_modify_rule(
-                pattern, artifacts_queue, materials_dict, products_dict
-            )
-
-        elif _type == "allow":
-            consumed = verify_allow_rule(pattern, artifacts_queue)
-
-        # It's up to the "disallow" and "require" rule to raise an error if
-        # artifacts were not consumed as intended
-        elif _type == "disallow":
-            verify_disallow_rule(pattern, artifacts_queue)
-
-        elif _type == "require":
-            verify_require_rule(pattern, artifacts_queue)
-
-        else:  # pragma: no cover (unreachable)
-            raise securesystemslib.exceptions.FormatError(
-                f"Invaldid rule type '{_type}'."
-            )
-
-        artifacts_queue -= consumed
-
-        # Append rule and copy of queue to global info for a rich error message
-        RULE_TRACE["trace"].append(
-            {"rule": rule, "queue": list(artifacts_queue)}
-        )
+    finally:
+        RULE_TRACE.reset(rule_trace_token)
 
 
 def verify_all_item_rules(items, links):
